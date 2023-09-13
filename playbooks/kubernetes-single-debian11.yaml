@@ -1,0 +1,244 @@
+- name: Configure Kubernetes Node
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install packages
+      apt:
+        name:
+          - apt-transport-https
+          - mc
+          - ca-certificates
+          - curl
+          - gnupg2
+          - software-properties-common
+          - bash-completion
+          - wget
+          - haveged
+          - mariadb-client
+          - apparmor
+        state: present
+
+    - name: Import GPG key for Kubernetes repo
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes repository
+      apt_repository:
+        repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        state: present
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Configure bash completion for kubectl
+      lineinfile:
+        path: ~/.bashrc
+        line: "source <(kubectl completion bash)"
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure sysctl settings for Kubernetes
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+      with_items:
+        - { key: "net.bridge.bridge-nf-call-iptables", value: 1 }
+        - { key: "net.ipv4.ip_forward", value: 1 }
+        - { key: "net.bridge.bridge-nf-call-ip6tables", value: 1 }
+
+    - name: Download containerd tarball
+      get_url:
+        url: https://github.com/containerd/containerd/releases/download/v1.7.0/containerd-1.7.0-linux-amd64.tar.gz
+        dest: /usr/local/containerd-1.7.0-linux-amd64.tar.gz
+      register: download_result
+
+    - name: Extract containerd tarball
+      unarchive:
+        src: /usr/local/containerd-1.7.0-linux-amd64.tar.gz
+        dest: /usr/local
+        remote_src: yes
+      when: download_result.changed
+
+    - name: Create directory /usr/local/lib/systemd/
+      file:
+        path: /usr/local/lib/systemd/
+        state: directory
+
+    - name: Create directory /usr/local/lib/systemd/system
+      file:
+        path: /usr/local/lib/systemd/system
+        state: directory
+
+    - name: Download containerd service file
+      get_url:
+        url: https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+        dest: /usr/local/lib/systemd/system/containerd.service   
+      register: download_result
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      when: download_result.changed  
+
+    - name: Enable and start containerd service
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Download and install runc
+      get_url:
+        url: "https://github.com/opencontainers/runc/releases/download/v1.1.2/runc.amd64"
+        dest: "/usr/local/sbin/runc"
+        mode: "0755"
+
+    - name: Configure CRI Containerd
+      command: "crictl config --set runtime-endpoint=unix:///run/containerd/containerd.sock --set image-endpoint=unix:///run/containerd/containerd.sock"
+
+    - name: Create the /etc/containerd directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Check if containerd config exists
+      stat: 
+        path:  /etc/containerd/config.toml
+      register: containerd_exists
+
+    - name: Get defaults from containerd
+      command: containerd config default
+      changed_when: false
+      register: containerd_config_default
+      when: containerd_exists.stat.exists == False
+
+    - name: Prepare containerd/config.toml from default config
+      copy:
+        dest: /tmp/containerd_config.toml
+        content: "{{ containerd_config_default.stdout }}"
+      when: containerd_exists.stat.exists == False
+      changed_when: false
+
+    - name: Copy config.toml to /etc/containerd
+      copy:
+        remote_src: true
+        src: /tmp/containerd_config.toml
+        dest: /etc/containerd/config.toml
+      when: containerd_exists.stat.exists == False
+
+    - name: Cleanup temporary file
+      file:
+        path: /tmp/containerd_config.toml
+        state: absent
+      changed_when: false
+      
+    - name: Enable SystemdCgroup in Containerd config
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        line: 'SystemdCgroup = true'
+      register: containerd_config
+
+    - name: Restart Containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+      when: containerd_config.changed
+
+    - name: Create kubeadm-config.yaml file
+      copy:
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: stable
+          networking:
+            podSubnet: "10.244.0.0/16"
+          apiServer:
+            certSANs:
+              - "127.0.0.1"
+              - "{{ IP }}"
+        dest: /root/kubeadm-config.yaml
+
+    - name: Pull Kubernetes container images
+      command: kubeadm config images pull
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --config kubeadm-config.yaml
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create .kube directory
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+
+    - name: Copy admin.conf to .kube directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        mode: '0644'
+        remote_src: yes
+
+    - name: Deploy Flannel network plugin
+      command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml   
+
+    - name: Generate Kubernetes token
+      command: kubeadm token create --ttl 0
+      register: token
+
+    - name: Generate Kubernetes CA
+      shell: >
+        openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt |
+        openssl rsa -pubin -outform der 2>/dev/null |
+        openssl dgst -sha256 -hex |
+        sed 's/^.* //'
+      register: ca
+
+    - name: Save token to file
+      copy:
+        content: "{{ token.stdout }}"
+        dest: /root/k8s_token
+
+    - name: Save CA to file
+      copy:
+        content: "{{ ca.stdout }}"
+        dest: /root/k8s_ca
+
+    - name: Add evictionHard settings to kubelet config
+      blockinfile:
+        path: /var/lib/kubelet/config.yaml
+        block: |
+          evictionHard:
+            nodefs.available: "2Gi"
+            imagefs.available: "2Gi"
+      register: kubelet_config_updated
+      changed_when: kubelet_config_updated.changed
+
+    - name: Restart kubelet service
+      systemd:
+        name: kubelet
+        state: restarted
+      when: kubelet_config_updated.changed

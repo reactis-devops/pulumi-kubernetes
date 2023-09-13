@@ -1,0 +1,66 @@
+- name: Install and configure MariaDB
+  hosts: all
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - apt-transport-https
+        - mc
+        - ca-certificates
+        - curl
+        - gnupg2
+        - software-properties-common
+        - dirmngr
+        - rsync
+        - mariadb-server
+        - mariadb-backup
+
+    - name: Stop MariaDB service
+      service:
+        name: mysql
+        state: stopped
+
+    - name: Create server configuration file
+      copy:
+        dest: /etc/mysql/mariadb.conf.d/50-server.cnf
+        content: |
+          [mysqld]
+          server-id={{ SERVERID }}
+          gtid-domain-id={{ DOMAINID }}
+          gtid-ignore-duplicates=ON
+          log_slave_updates=ON
+          auto_increment_increment=2
+          auto_increment_offset={{ DOMAINID }}
+          binlog_format=ROW
+          default-storage-engine=innodb
+          innodb_autoinc_lock_mode=2
+          query_cache_size=0
+          query_cache_type=0
+          bind-address=0.0.0.0
+          sql_mode=""
+          expire_logs_days=2
+
+      register: config_file
+
+    - name: Check if configuration file has changed
+      stat:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+      register: config_file_stat
+
+    - name: Restart MariaDB service if configuration file has changed
+      service:
+        name: mariadb
+        state: restarted
+      when: config_file_stat.stat.exists and config_file.changed
+
+    - name: Ensure MariaDB service is running
+      service:
+        name: mariadb
+        state: started
